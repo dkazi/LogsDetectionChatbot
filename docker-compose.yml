@@ -7,8 +7,6 @@ services:
       - /var/log:/data_to_monitor:ro
       - logguard_data:/app/chat_history
     restart: unless-stopped
-    privileged: true
-    network_mode: host
 
 volumes:
   logguard_data:
