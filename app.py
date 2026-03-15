@@ -9,8 +9,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from datetime import datetime
 from openai import OpenAI
-import sys
-sys.path.insert(0, "/app")
 
 # ── PATHS ──────────────────────────────────────────────────────────────────────
 WATCH_DIR        = "/data_to_monitor"
@@ -23,16 +21,18 @@ os.makedirs(HISTORY_DIR, exist_ok=True)
 st.set_page_config(page_title="AI Log Security Analyst",
                    layout="wide", page_icon="🛡️")
 
+# ── API KEY από .env ───────────────────────────────────────────────────────────
+api_key = os.getenv("OPENAI_API_KEY", "")
+
 # ── SESSION STATE ──────────────────────────────────────────────────────────────
 for k, v in {
-    "logging_active":   False,
-    "messages":         [],
-    "multiselect_key":  0,
-    "ai_error":         None,
-    "last_pos":         {},
-    "session_name":     datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
-    "detection_running": False,
-    "chat_history":     [],   # for GOD_OF_CHAT intent engine
+    "logging_active":  False,
+    "messages":        [],       # chatbot tab
+    "soc_messages":    [],       # soc tab
+    "multiselect_key": 0,
+    "ai_error":        None,
+    "last_pos":        {},
+    "session_name":    datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -47,7 +47,7 @@ if os.path.exists(WATCH_DIR):
     files.sort()
 
 # ── HELPERS ────────────────────────────────────────────────────────────────────
-def read_last_n_lines(filepath: str, n: int = 200) -> list:
+def read_last_n_lines(filepath, n=200):
     try:
         with open(filepath, "rb") as f:
             f.seek(0, 2)
@@ -62,14 +62,14 @@ def read_last_n_lines(filepath: str, n: int = 200) -> list:
         return [f"[error: {e}]"]
 
 
-def save_history(session_name: str, messages: list):
+def save_history(session_name, messages):
     path = os.path.join(HISTORY_DIR, f"{session_name}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"session": session_name, "messages": messages}, f,
                   ensure_ascii=False, indent=2)
 
 
-def load_all_sessions() -> dict:
+def load_all_sessions():
     sessions = {}
     for fname in sorted(os.listdir(HISTORY_DIR), reverse=True):
         if fname.endswith(".json"):
@@ -83,7 +83,7 @@ def load_all_sessions() -> dict:
     return sessions
 
 
-def load_detection_results() -> dict:
+def load_detection_results():
     if os.path.exists(RESULTS_FILE):
         try:
             with open(RESULTS_FILE, encoding="utf-8") as f:
@@ -93,7 +93,41 @@ def load_detection_results() -> dict:
     return None
 
 
-def generate_pdf(messages: list, session_name: str) -> bytes:
+def run_detection():
+    """
+    Τρέχει GOD_OF_DETECTION incremental.
+    Επιστρέφει (success, output_text).
+    """
+    env = os.environ.copy()
+    env["OPENAI_API_KEY"]  = api_key
+    env["LOG_FILE_PATH"]   = MASTER_FILE_PATH
+    env["CHROMA_PATH"]     = "/app/chroma_db_v2"
+    try:
+        result = subprocess.run(
+            ["python3", "/app/GOD_OF_DETECTION.py"],
+            capture_output=True, text=True,
+            cwd="/app", env=env, timeout=300,
+        )
+        return result.returncode == 0, result.stdout + result.stderr
+    except Exception as e:
+        return False, str(e)
+
+
+def ask_god_of_chat(question, history):
+    """
+    Καλεί GOD_OF_CHAT.ask() με τα τρέχοντα detection results.
+    Επιστρέφει string απάντηση.
+    """
+    import GOD_OF_CHAT as god_chat
+    results = load_detection_results()
+    if not results:
+        return "❌ Δεν υπάρχουν detection results. Βεβαιώσου ότι έχεις επιλέξει log αρχεία και κάνεις monitoring."
+    # Τελευταία 4 μηνύματα για follow-up context
+    chat_history = [m for m in history if m["role"] in ("user", "assistant")][-4:]
+    return god_chat.ask(question, results, chat_history)
+
+
+def generate_pdf(messages, session_name):
     lines = ["LogGuard AI — Chat Export", f"Session: {session_name}", ""]
     for m in messages:
         role = "You" if m["role"] == "user" else "AI Analyst"
@@ -108,7 +142,7 @@ def generate_pdf(messages: list, session_name: str) -> bytes:
     objects_body = b""
     offsets = []
 
-    def write_obj(oid: int, content: str):
+    def write_obj(oid, content):
         nonlocal objects_body
         offsets.append(len(b"%PDF-1.4\n") + len(objects_body))
         objects_body += f"{oid} 0 obj\n{content}\nendobj\n".encode()
@@ -147,8 +181,7 @@ def generate_pdf(messages: list, session_name: str) -> bytes:
     return b"%PDF-1.4\n" + objects_body + xref.encode() + trailer.encode()
 
 
-# ── FLAGS ──────────────────────────────────────────────────────────────────────
-def load_flags() -> dict:
+def load_flags():
     if os.path.exists(FLAGS_FILE):
         try:
             with open(FLAGS_FILE) as f:
@@ -158,12 +191,12 @@ def load_flags() -> dict:
     return {}
 
 
-def save_flags(data: dict):
+def save_flags(data):
     with open(FLAGS_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
 
-def extract_ips_from_logs(selected: list, n: int = 1000) -> dict:
+def extract_ips_from_logs(selected, n=1000):
     ip_pattern = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
     counts = {}
     for rel in selected:
@@ -190,7 +223,7 @@ def _base_fig(w=7, h=3.2):
     ax.set_axisbelow(True)
     return fig, ax
 
-def bar_chart(data: dict, title: str, color="#4da6ff"):
+def bar_chart(data, title, color="#4da6ff"):
     if not data: return None
     fig, ax = _base_fig()
     keys, vals = list(data.keys()), list(data.values())
@@ -203,7 +236,7 @@ def bar_chart(data: dict, title: str, color="#4da6ff"):
     fig.tight_layout()
     return fig
 
-def pie_chart(data: dict, title: str):
+def pie_chart(data, title):
     if not data: return None
     items = sorted(data.items(), key=lambda x: x[1], reverse=True)
     if len(items) > 6:
@@ -225,7 +258,7 @@ def pie_chart(data: dict, title: str):
     fig.tight_layout()
     return fig
 
-def hourly_bar(hourly: dict, title: str):
+def hourly_bar(hourly, title):
     if not any(hourly.values()): return None
     fig, ax = _base_fig(w=8, h=3)
     hours, vals = list(hourly.keys()), list(hourly.values())
@@ -242,256 +275,8 @@ def hourly_bar(hourly: dict, title: str):
     return fig
 
 
-# ── API KEY — διαβάζεται από το .env, όχι από το UI ──────────────────────────
-api_key = os.getenv("OPENAI_API_KEY", "")
-
-# ── SIDEBAR ────────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.header("⚙️ System Settings")
-    if not api_key:
-        st.error("⚠️ OPENAI_API_KEY δεν βρέθηκε.\nΠρόσθεσέ το στο .env αρχείο.")
-    else:
-        st.success("✅ OpenAI API Key φορτώθηκε.")
-    st.markdown("---")
-    st.subheader("📁 Log Sources")
-    selected_files = st.multiselect(
-        "Select Files:", options=files, default=None,
-        disabled=st.session_state.logging_active,
-        key=f"files_{st.session_state.multiselect_key}",
-    )
-    if not st.session_state.logging_active:
-        if st.button("✅ Start Monitoring", type="primary",
-                     use_container_width=True):
-            if selected_files:
-                st.session_state.logging_active  = True
-                st.session_state.session_name    = datetime.now().strftime(
-                    "%Y-%m-%d_%H-%M-%S")
-                st.session_state.last_pos = {}
-                with open(MASTER_FILE_PATH, "w", encoding="utf-8") as f:
-                    f.write(f"--- SESSION START: {time.strftime('%H:%M:%S')} ---\n")
-                st.rerun()
-            else:
-                st.warning("Select at least one file!")
-    else:
-        if st.button("🗑️ Reset & Clear All", type="secondary",
-                     use_container_width=True):
-            st.session_state.logging_active  = False
-            st.session_state.messages        = []
-            st.session_state.ai_error        = None
-            st.session_state.multiselect_key += 1
-            st.session_state.last_pos        = {}
-            if os.path.exists(MASTER_FILE_PATH):
-                os.remove(MASTER_FILE_PATH)
-            st.rerun()
-    if st.session_state.logging_active:
-        st.markdown("---")
-        st.success("📡 Monitoring Active")
-    if st.session_state.ai_error:
-        st.error(st.session_state.ai_error)
-
-
-# ── TABS ───────────────────────────────────────────────────────────────────────
-tab_chat, tab_soc, tab_dashboard, tab_live, tab_history, tab_flags = st.tabs([
-    "🤖 AI Chatbot",
-    "🛡️ SOC Analysis",
-    "📊 Dashboard",
-    "📡 Live Logs",
-    "🕓 History",
-    "🚩 Flagged IPs",
-])
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  TAB 1 — CHATBOT (simple, logs-based, as before)
-# ══════════════════════════════════════════════════════════════════════════════
-with tab_chat:
-    st.title("🤖 AI Security Analyst")
-    tb1, tb2, tb3 = st.columns([1, 1, 1])
-    with tb1:
-        if st.button("🆕 New chat", use_container_width=True):
-            if st.session_state.messages:
-                save_history(st.session_state.session_name,
-                             st.session_state.messages)
-            st.session_state.messages     = []
-            st.session_state.session_name = datetime.now().strftime(
-                "%Y-%m-%d_%H-%M-%S")
-            st.session_state.ai_error     = None
-            st.rerun()
-    with tb2:
-        if st.button("💾 Save chat", use_container_width=True,
-                     disabled=not st.session_state.messages):
-            save_history(st.session_state.session_name,
-                         st.session_state.messages)
-            st.toast("✅ Chat saved!")
-    with tb3:
-        if st.session_state.messages:
-            pdf_bytes = generate_pdf(st.session_state.messages,
-                                     st.session_state.session_name)
-            st.download_button("📄 Export PDF", data=pdf_bytes,
-                file_name=f"logguard_{st.session_state.session_name}.pdf",
-                mime="application/pdf", use_container_width=True)
-    st.divider()
-
-    can_chat = bool(api_key and selected_files and st.session_state.logging_active)
-    if not can_chat:
-        if not api_key:
-            st.error("OPENAI_API_KEY δεν βρέθηκε στο .env αρχείο.")
-        elif not st.session_state.logging_active:
-            st.warning("Start monitoring from the sidebar first.")
-
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-
-    if prompt := st.chat_input("Ask me about the logs…", disabled=not can_chat):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        st.session_state.ai_error = None
-        with st.chat_message("assistant"):
-            loading = st.empty()
-            loading.html("""
-<style>
-@keyframes blink {
-  0%,100% { opacity: 1; } 50% { opacity: 0.2; }
-}
-</style>
-<div style="display:flex;align-items:center;gap:10px;padding:8px 0;">
-  <div style="display:flex;gap:5px;">
-    <div style="width:8px;height:8px;border-radius:50%;background:#00e676;
-                animation:blink 1.2s ease-in-out infinite;"></div>
-    <div style="width:8px;height:8px;border-radius:50%;background:#00e676;
-                animation:blink 1.2s ease-in-out infinite 0.2s;"></div>
-    <div style="width:8px;height:8px;border-radius:50%;background:#00e676;
-                animation:blink 1.2s ease-in-out infinite 0.4s;"></div>
-  </div>
-  <span style="color:#00e676;font-size:13px;font-family:monospace;">
-    Analyzing logs…
-  </span>
-</div>
-""")
-            try:
-                client = OpenAI(api_key=api_key)
-                log_context = ""
-                if os.path.exists(MASTER_FILE_PATH):
-                    with open(MASTER_FILE_PATH, "r", encoding="utf-8") as f:
-                        log_context = f.read()[-5000:]
-                response = client.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=[
-                        {"role": "system", "content": "You are a Cyber Security Analyst."},
-                        {"role": "user",
-                         "content": f"LOGS:\n{log_context}\n\nQUESTION: {prompt}"},
-                    ],
-                )
-                reply = response.choices[0].message.content
-                loading.empty()
-                st.markdown(reply)
-                st.session_state.messages.append({"role": "assistant", "content": reply})
-                save_history(st.session_state.session_name, st.session_state.messages)
-            except Exception as e:
-                loading.empty()
-                st.session_state.ai_error = f"AI Error: {e}"
-        st.rerun()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  TAB 2 — SOC ANALYSIS (GOD_OF_DETECTION + GOD_OF_CHAT)
-# ══════════════════════════════════════════════════════════════════════════════
-with tab_soc:
-    st.title("🛡️ SOC Deep Analysis")
-    st.caption("Run GOD_OF_DETECTION on your logs, then ask the SOC chatbot.")
-
-    # ── Step 1: Run detection ──────────────────────────────────────────────────
-    st.subheader("Step 1 — Run detection engine")
-
-    # Find log files inside container to pass to detection
-    log_files_available = []
-    if os.path.exists(WATCH_DIR):
-        for root, _, fnames in os.walk(WATCH_DIR):
-            for fn in fnames:
-                log_files_available.append(
-                    os.path.join(root, fn))
-
-    detection_target = st.selectbox(
-        "Log file to analyze:",
-        options=log_files_available if log_files_available else ["(no files found)"],
-        label_visibility="visible",
-    )
-
-    col_run, col_status = st.columns([1, 3])
-    with col_run:
-        run_detection = st.button(
-            "▶ Run GOD_OF_DETECTION",
-            type="primary",
-            use_container_width=True,
-            disabled=not (api_key and log_files_available),
-        )
-    with col_status:
-        results = load_detection_results()
-        if results:
-            st.success(
-                f"✅ Last run: {results['generated_at'][:16]}  |  "
-                f"{results['total_logs']} logs  |  "
-                f"{results['suspicious_ips_count']} suspicious IPs"
-            )
-        else:
-            st.info("No detection results yet. Run the engine first.")
-
-    if run_detection:
-        if not api_key:
-            st.error("Enter OpenAI API key first.")
-        else:
-            with st.spinner("Running GOD_OF_DETECTION… this may take a minute."):
-                env = os.environ.copy()
-                env["OPENAI_API_KEY"] = api_key
-                env["LOG_FILE_PATH"]  = detection_target
-                result = subprocess.run(
-                    ["python3", "/app/GOD_OF_DETECTION.py"],
-                    capture_output=True, text=True,
-                    cwd="/app", env=env, timeout=300,
-                )
-            if result.returncode == 0:
-                st.success("Detection complete!")
-                with st.expander("Detection output"):
-                    st.code(result.stdout[-3000:], language="text")
-                st.rerun()
-            else:
-                st.error("Detection failed.")
-                with st.expander("Error details"):
-                    st.code(result.stderr[-2000:], language="text")
-
-    st.divider()
-
-    # ── Step 2: SOC Chat — χρησιμοποιεί απευθείας GOD_OF_CHAT.ask() ─────────────
-    st.subheader("Step 2 — Ask the SOC chatbot")
-
-    results = load_detection_results()
-    can_soc_chat = bool(api_key and results)
-
-    if not can_soc_chat:
-        if not api_key:
-            st.error("OPENAI_API_KEY δεν βρέθηκε στο .env αρχείο.")
-        elif not results:
-            st.warning("Run detection first (Step 1).")
-
-    # Show SOC chat history
-    for msg in st.session_state.chat_history:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-
-    if soc_prompt := st.chat_input(
-        "Ask the SOC analyst… e.g. 'Ποια η πιο επικίνδυνη IP;'",
-        disabled=not can_soc_chat,
-        key="soc_input",
-    ):
-        st.session_state.chat_history.append(
-            {"role": "user", "content": soc_prompt})
-        with st.chat_message("user"):
-            st.markdown(soc_prompt)
-
-        with st.chat_message("assistant"):
-            # Animated loading indicator
-            loading = st.empty()
-            loading.html("""
+# ── LOADING ANIMATION HTML ─────────────────────────────────────────────────────
+LOADING_BLUE = """
 <style>
 @keyframes blink {
   0%,100% { opacity: 1; } 50% { opacity: 0.2; }
@@ -510,51 +295,256 @@ with tab_soc:
     SOC Analyst analyzing…
   </span>
 </div>
-""")
+"""
+
+LOADING_GREEN = """
+<div style="display:flex;align-items:center;gap:10px;padding:8px 0;">
+  <div style="display:flex;gap:5px;">
+    <div style="width:8px;height:8px;border-radius:50%;background:#00e676;
+                animation:blink 1.2s ease-in-out infinite;"></div>
+    <div style="width:8px;height:8px;border-radius:50%;background:#00e676;
+                animation:blink 1.2s ease-in-out infinite 0.2s;"></div>
+    <div style="width:8px;height:8px;border-radius:50%;background:#00e676;
+                animation:blink 1.2s ease-in-out infinite 0.4s;"></div>
+  </div>
+  <span style="color:#00e676;font-size:13px;font-family:monospace;">
+    Analyzing logs…
+  </span>
+</div>
+"""
+
+
+# ── SIDEBAR ────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("⚙️ System Settings")
+    if not api_key:
+        st.error("⚠️ OPENAI_API_KEY δεν βρέθηκε.\nΠρόσθεσέ το στο .env αρχείο.")
+    else:
+        st.success("✅ OpenAI API Key φορτώθηκε.")
+    st.markdown("---")
+    st.subheader("📁 Log Sources")
+
+    selected_files = st.multiselect(
+        "Select Files:", options=files, default=None,
+        disabled=st.session_state.logging_active,
+        key=f"files_{st.session_state.multiselect_key}",
+    )
+
+    if not st.session_state.logging_active:
+        if st.button("✅ Start Monitoring", type="primary",
+                     use_container_width=True):
+            if selected_files:
+                st.session_state.logging_active  = True
+                st.session_state.session_name    = datetime.now().strftime(
+                    "%Y-%m-%d_%H-%M-%S")
+                st.session_state.last_pos = {}
+                with open(MASTER_FILE_PATH, "w", encoding="utf-8") as f:
+                    f.write(f"--- SESSION START: {time.strftime('%H:%M:%S')} ---\n")
+                st.rerun()
+            else:
+                st.warning("Select at least one file!")
+    else:
+        if st.button("🗑️ Reset & Clear All", type="secondary",
+                     use_container_width=True):
+            st.session_state.logging_active  = False
+            st.session_state.messages        = []
+            st.session_state.soc_messages    = []
+            st.session_state.ai_error        = None
+            st.session_state.multiselect_key += 1
+            st.session_state.last_pos        = {}
+            if os.path.exists(MASTER_FILE_PATH):
+                os.remove(MASTER_FILE_PATH)
+            st.rerun()
+
+    if st.session_state.logging_active:
+        st.markdown("---")
+        st.success("📡 Monitoring Active")
+
+
+# ── TABS ───────────────────────────────────────────────────────────────────────
+tab_soc, tab_chat, tab_dashboard, tab_live, tab_history, tab_flags = st.tabs([
+    "🛡️ SOC Analysis",
+    "🤖 AI Chatbot",
+    "📊 Dashboard",
+    "📡 Live Logs",
+    "🕓 History",
+    "🚩 Flagged IPs",
+])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TAB 1 — SOC ANALYSIS
+#  Ροή: prompt → GOD_OF_DETECTION (auto) → GOD_OF_CHAT.ask() → interface
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_soc:
+    st.title("🛡️ SOC Analysis")
+
+    # Κουμπιά πάνω
+    tb1, tb2, tb3 = st.columns([1, 1, 1])
+    with tb1:
+        if st.button("🆕 New chat", use_container_width=True):
+            if st.session_state.soc_messages:
+                save_history("SOC_" + st.session_state.session_name,
+                             st.session_state.soc_messages)
+            st.session_state.soc_messages = []
+            st.rerun()
+    with tb2:
+        if st.button("💾 Save chat", use_container_width=True,
+                     disabled=not st.session_state.soc_messages):
+            save_history("SOC_" + st.session_state.session_name,
+                         st.session_state.soc_messages)
+            st.toast("✅ Chat saved!")
+    with tb3:
+        if st.session_state.soc_messages:
+            pdf_bytes = generate_pdf(st.session_state.soc_messages,
+                                     st.session_state.session_name)
+            st.download_button("📄 Export PDF", data=pdf_bytes,
+                file_name=f"soc_{st.session_state.session_name}.pdf",
+                mime="application/pdf", use_container_width=True)
+
+    st.divider()
+
+    # Status από τελευταίο detection run
+    results = load_detection_results()
+    if results:
+        st.caption(
+            f"🔍 Last detection: {results['generated_at'][:16]}  |  "
+            f"{results['total_logs']} logs  |  "
+            f"{results['suspicious_ips_count']} suspicious IPs"
+        )
+
+    can_chat = bool(api_key and st.session_state.logging_active)
+    if not can_chat:
+        if not api_key:
+            st.error("OPENAI_API_KEY δεν βρέθηκε στο .env αρχείο.")
+        elif not st.session_state.logging_active:
+            st.warning("Start monitoring from the sidebar first.")
+
+    # Chat history
+    for msg in st.session_state.soc_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # Chat input
+    if soc_prompt := st.chat_input(
+        "Ρώτα για τα logs… π.χ. 'Ποια η πιο επικίνδυνη IP;'",
+        disabled=not can_chat,
+        key="soc_input",
+    ):
+        st.session_state.soc_messages.append(
+            {"role": "user", "content": soc_prompt})
+        with st.chat_message("user"):
+            st.markdown(soc_prompt)
+
+        with st.chat_message("assistant"):
+            loading = st.empty()
+            loading.html(LOADING_BLUE)
+
             try:
-                import GOD_OF_CHAT as god_chat
+                # ── Βήμα 1: Τρέξε GOD_OF_DETECTION (incremental) ─────────────
+                det_ok, det_out = run_detection()
+                if not det_ok:
+                    loading.empty()
+                    st.warning(f"Detection warning: {det_out[:300]}")
 
-                # history για follow-up ερωτήσεις (τελευταία 4 μηνύματα)
-                history_for_chat = [
-                    m for m in st.session_state.chat_history[:-1]
-                    if m["role"] in ("user", "assistant")
-                ][-4:]
+                # ── Βήμα 2: Στείλε prompt στο GOD_OF_CHAT ────────────────────
+                reply = ask_god_of_chat(
+                    soc_prompt,
+                    st.session_state.soc_messages[:-1]  # χωρίς το τρέχον
+                )
 
-                # prompt → GOD_OF_CHAT.ask() → απάντηση → interface
-                reply = god_chat.ask(soc_prompt, results, history_for_chat)
-
-                # Καθάρισε το loading και εμφάνισε την απάντηση
                 loading.empty()
                 st.markdown(reply)
-                st.session_state.chat_history.append(
+                st.session_state.soc_messages.append(
                     {"role": "assistant", "content": reply})
+                # Auto-save
+                save_history("SOC_" + st.session_state.session_name,
+                             st.session_state.soc_messages)
+
             except Exception as e:
                 loading.empty()
-                st.error(f"GOD_OF_CHAT error: {e}")
+                st.error(f"Error: {e}")
 
-    if st.session_state.chat_history:
-        sc1, sc2 = st.columns([1, 5])
-        with sc1:
-            if st.button("🗑️ Clear SOC chat"):
-                st.session_state.chat_history = []
-                st.rerun()
-        with sc2:
-            if st.button("💾 Save SOC chat"):
-                name = "SOC_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                save_history(name, st.session_state.chat_history)
-                st.toast("✅ SOC chat saved!")
 
-        # Quick-result cards from detection
-        if results:
-            st.divider()
-            st.caption("Quick stats from last detection run:")
-            qc1, qc2, qc3, qc4 = st.columns(4)
-            qc1.metric("Total logs",     results["total_logs"])
-            qc2.metric("Unique IPs",     results["unique_ips"])
-            qc3.metric("Suspicious IPs", results["suspicious_ips_count"])
-            top_attack = max(results["attack_stats"].items(),
-                             key=lambda x: x[1], default=("—", 0))
-            qc4.metric("Top attack", f"{top_attack[0]} ({top_attack[1]})")
+# ══════════════════════════════════════════════════════════════════════════════
+#  TAB 2 — CHATBOT (απλός, βασισμένος σε raw logs)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_chat:
+    st.title("🤖 AI Chatbot")
+
+    tb1, tb2, tb3 = st.columns([1, 1, 1])
+    with tb1:
+        if st.button("🆕 New chat", use_container_width=True, key="chat_new"):
+            if st.session_state.messages:
+                save_history(st.session_state.session_name,
+                             st.session_state.messages)
+            st.session_state.messages    = []
+            st.session_state.session_name = datetime.now().strftime(
+                "%Y-%m-%d_%H-%M-%S")
+            st.rerun()
+    with tb2:
+        if st.button("💾 Save chat", use_container_width=True,
+                     disabled=not st.session_state.messages,
+                     key="chat_save"):
+            save_history(st.session_state.session_name,
+                         st.session_state.messages)
+            st.toast("✅ Chat saved!")
+    with tb3:
+        if st.session_state.messages:
+            pdf_bytes = generate_pdf(st.session_state.messages,
+                                     st.session_state.session_name)
+            st.download_button("📄 Export PDF", data=pdf_bytes,
+                file_name=f"logguard_{st.session_state.session_name}.pdf",
+                mime="application/pdf", use_container_width=True,
+                key="chat_pdf")
+
+    st.divider()
+
+    can_chat_simple = bool(api_key and selected_files
+                           and st.session_state.logging_active)
+    if not can_chat_simple:
+        if not api_key:
+            st.error("OPENAI_API_KEY δεν βρέθηκε.")
+        elif not st.session_state.logging_active:
+            st.warning("Start monitoring from the sidebar first.")
+
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    if prompt := st.chat_input("Ask me about the logs…",
+                                disabled=not can_chat_simple,
+                                key="chat_input"):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("assistant"):
+            loading = st.empty()
+            loading.html(LOADING_GREEN)
+            try:
+                client = OpenAI(api_key=api_key)
+                log_context = ""
+                if os.path.exists(MASTER_FILE_PATH):
+                    with open(MASTER_FILE_PATH, "r", encoding="utf-8") as f:
+                        log_context = f.read()[-5000:]
+                response = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system",
+                         "content": "You are a Cyber Security Analyst."},
+                        {"role": "user",
+                         "content": f"LOGS:\n{log_context}\n\nQUESTION: {prompt}"},
+                    ],
+                )
+                reply = response.choices[0].message.content
+                loading.empty()
+                st.markdown(reply)
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": reply})
+                save_history(st.session_state.session_name,
+                             st.session_state.messages)
+            except Exception as e:
+                loading.empty()
+                st.error(f"AI Error: {e}")
+        st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -575,8 +565,8 @@ with tab_dashboard:
             st.caption(f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
         st.divider()
 
-        total_lines    = 0
-        ip_counts = {}
+        total_lines  = 0
+        ip_counts    = {}
         keyword_counts = {
             "Failed password": 0,
             "Accepted":        0,
@@ -585,8 +575,8 @@ with tab_dashboard:
             "error":           0,
             "UFW BLOCK":       0,
         }
-        hourly_counts  = {str(h).zfill(2): 0 for h in range(24)}
-        ip_pattern     = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+        hourly_counts = {str(h).zfill(2): 0 for h in range(24)}
+        ip_pattern    = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 
         for rel in selected_files:
             lines = read_last_n_lines(os.path.join(WATCH_DIR, rel), 2000)
@@ -653,6 +643,7 @@ with tab_dashboard:
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_live:
     st.title("📡 Live Logs")
+
     if not st.session_state.logging_active or not selected_files:
         st.info("Start monitoring from the sidebar to see live logs.")
     else:
@@ -682,7 +673,8 @@ with tab_live:
 
         n_lines = st.slider("Lines per file", 50, 500, 150, step=50,
                             key="live_slider")
-        search  = st.text_input("Filter", placeholder="e.g. sshd, sudo, 192.168",
+        search  = st.text_input("Filter",
+                                placeholder="e.g. sshd, sudo, 192.168",
                                 label_visibility="collapsed")
 
         for rel in selected_files:
@@ -696,11 +688,13 @@ with tab_live:
                     rows = "".join(
                         '<div style="font-family:monospace;font-size:12px;'
                         'padding:1px 4px;color:#c8c8c8;">'
-                        + l.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+                        + l.replace("&","&amp;").replace("<","&lt;")
+                                   .replace(">","&gt;")
                         + "</div>" for l in lines)
                     st.html('<div style="background:#0e1117;border-radius:6px;'
                             'padding:10px;max-height:320px;overflow-y:auto;'
                             'border:1px solid #2a2a2a;">' + rows + "</div>")
+
         if auto:
             time.sleep(4)
             st.rerun()
@@ -772,7 +766,8 @@ with tab_flags:
                 with col_note:
                     note = st.text_input("Note", key=f"note_{ip}",
                         value=flags.get(ip, {}).get("note", ""),
-                        placeholder="add a note…", label_visibility="collapsed")
+                        placeholder="add a note…",
+                        label_visibility="collapsed")
                     if note != flags.get(ip, {}).get("note", ""):
                         if ip not in flags:
                             flags[ip] = {}
