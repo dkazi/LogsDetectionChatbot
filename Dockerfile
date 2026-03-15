@@ -13,10 +13,17 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Αποσυμπίεση ChromaDB και διαγραφή του .tar.gz για να μην πιάνει χώρο
+# Αποσυμπίεση ChromaDB
 RUN tar -xzf chroma_db_v2.tar.gz && rm chroma_db_v2.tar.gz
 
+# Επαλήθευση ότι το ChromaDB είναι εκεί
+RUN echo "=== ChromaDB contents ===" && ls -la /app/chroma_db_v2/
+
 RUN mkdir -p /data_to_monitor /app/chat_history
+
+# Απενεργοποίηση chromadb telemetry (αποφυγή capture() bug)
+ENV ANONYMIZED_TELEMETRY=false
+ENV CHROMA_TELEMETRY=false
 
 EXPOSE 8501
 
