@@ -1,9 +1,6 @@
 services:
   logguard:
-    build:
-      context: .
-      args:
-        OPENAI_API_KEY: ${OPENAI_API_KEY}
+    build: .
     ports:
       - "8501:8501"
     volumes:
